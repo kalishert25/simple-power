@@ -144,7 +144,7 @@ do_ui_element :: proc(state: ^State, pos: [2]f32, text: cstring, bg_color: rl.Co
 	font_size : f32 = 32
 	spacing : f32 = 1
 	padding : [4]f32 = {10, 10, 10, 10}
-	text_size := rl.MeasureTextEx(rl.GetFontDefault(), text, font_size, spacing)
+	text_size := rl.MeasureTextEx(state.font, text, font_size, spacing)
 	bounding_box := rl.Rectangle{
 		pos.x - padding[0], pos.y - padding[1],
 		text_size.x + padding[0] + padding[2],
