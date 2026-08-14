@@ -5,35 +5,40 @@ import "core:mem"
 import "core:fmt"
 import "core:thread"
 import "core:sync"
+import "core:time"
 
 import rl "vendor:raylib"
 import ble "simpleble"
 
 
 MAX_DEVICES :: 10
+DATA_ARRAY_SIZE :: 2 * mem.Megabyte
 
 BG_COLOR 				:: rl.Color{20, 20, 50, 255}
 HOVER_COLOR 		:: rl.Color{60, 60, 100, 255}
 TEXT_COLOR 			:: rl.Color{190, 190, 230, 255}
 SELECT_COLOR    :: rl.Color{50, 120, 90, 255}
 
-
+GRAPH_LOOKBACK_SECONDS :: 60 * 5
 
 global_arena: mem.Arena
-global_buffer: [1024 * 1024 * 32]byte // 32MB
+global_buffer: [32 * mem.Megabyte]byte
 
 State :: struct {
 	ble_devices_mu: sync.Mutex,
 	ble_devices: [dynamic; MAX_DEVICES]DeviceView,
 	mouse_pos: [2]f32,
+	screen_size: [2]f32,
 	mouse_pressed: bool,
 	selected_power_meter_index: i32,
 	stop_scanning_for_ble_devices: bool,
 	font: rl.Font,
+	font_big: rl.Font,
 	mode: Mode,
-	current_power: i16,
-	data_stream_mu: sync.Mutex
+	power_data: RideDataArray,
 }
+
+
 
 DeviceView :: struct {
 	name: cstring,
@@ -45,6 +50,18 @@ Mode :: enum {
 	PAIRING,
 	RIDING,
 }
+
+RideDataArray :: struct {
+	mutex: sync.Mutex,
+	array: [dynamic]RideDataPoint,
+	graph_starting_index: i32,
+}
+
+RideDataPoint :: struct {
+	time: u32, // in unix seconds
+	value: i32,
+}
+
 
 
 enter_ride_mode_from_pairing_mode :: proc(state: ^State) {
@@ -68,7 +85,6 @@ enter_ride_mode_from_pairing_mode :: proc(state: ^State) {
 	// don't unlock the mutex while we remain in ride mode.
 	// this will block the background thread from listening for new devices
 	state.mode = .RIDING
-	fmt.println("entered ride mode")
 }
 
 main :: proc() {
@@ -76,8 +92,11 @@ main :: proc() {
 	for !rl.WindowShouldClose() {
 		defer free_all(context.temp_allocator)
 
+
 		state.mouse_pos = rl.GetMousePosition();
 		state.mouse_pressed = rl.IsMouseButtonPressed(.LEFT)
+		state.screen_size.x = f32(rl.GetScreenWidth())
+		state.screen_size.y = f32(rl.GetScreenHeight())
 
 		if rl.IsKeyPressed(.ENTER) {
 			if state.selected_power_meter_index >= 0 && state.mode == .PAIRING {
@@ -94,13 +113,77 @@ main :: proc() {
 			case .PAIRING:
 				draw_pairing_mode_ui(state)
 			case .RIDING:
-				pos := [2]f32{40, 40}
-				text := fmt.ctprintf("%d W", state.current_power)
-				do_ui_element(state, pos, text)
+				{
+
+					/*for {
+
+						current_start_time := state.ride_data[state.graph_start_index]
+						if current_start_time
+					}*/
+					pos := [2]f32{40, 40}
+					current_power := ride_data_get_current_value(&state.power_data)
+					text := fmt.ctprintf("%d W", current_power)
+					font_size := f32(64)
+					do_ui_element(state, pos, text, font_size)
+				}
+
+				starting_y_axis_maximum := 100
+				max_value := i32(starting_y_axis_maximum)
+				for i := state.power_data.graph_starting_index;
+					i < i32(len(state.power_data.array)); i += 1 {
+					value := state.power_data.array[i].value
+					if value > max_value {
+						max_value = value
+					}
+				}
+
+
+				graph_top 		: f32	= state.screen_size.y - 400
+				graph_bottom 	: f32 = state.screen_size.y - 50
+				graph_right 	: f32 = 50
+				graph_left 		: f32 = state.screen_size.x - 50
+
+				graph_width  := graph_right - graph_left
+				graph_height := graph_bottom - graph_top
+
+				graph_rect := rl.Rectangle{graph_left, graph_top, graph_width, graph_height}
+
+
+				// draw graph
+				{
+
+					graph_pos_from_data_point := proc(state: ^State, data_point: RideDataPoint, graph_rect: rl.Rectangle, max_value: i32) -> [2]f32 {
+
+
+						graph_right := graph_rect.x + graph_rect.width
+						graph_bottom := graph_rect.y + graph_rect.height
+
+						now := u32(time.to_unix_seconds(time.now()))
+						graph_start_cuttoff_time := now - GRAPH_LOOKBACK_SECONDS
+						width_per_second := graph_rect.width/GRAPH_LOOKBACK_SECONDS
+
+						seconds_after_duration_start := data_point.time - graph_start_cuttoff_time
+						xvalue := graph_rect.width * f32(seconds_after_duration_start) / f32(GRAPH_LOOKBACK_SECONDS)
+						height := graph_rect.height * f32(data_point.value) / f32(max_value)
+						pos := [2]f32{(graph_right - xvalue), (graph_bottom - height)}
+						return pos
+					}
+
+					for i := state.power_data.graph_starting_index;
+						i < i32(len(state.power_data.array)) - 1; i += 1 {
+						data_point0 := state.power_data.array[i]
+						data_point1 := state.power_data.array[i+1]
+
+						pos0 := graph_pos_from_data_point(state, data_point0, graph_rect, max_value)
+						pos1 := graph_pos_from_data_point(state, data_point1, graph_rect, max_value)
+					  rl.DrawLineEx(pos0, pos1, 2, rl.PURPLE)
+
+					}
+
+				}
 		}
 	}
 }
-
 
 draw_pairing_mode_ui :: proc(state: ^State) {
 
@@ -127,7 +210,7 @@ draw_pairing_mode_ui :: proc(state: ^State) {
 		bg_color : rl.Color  //HIGHLIGHT_COLOR
 		if state.selected_power_meter_index == i32(i) do bg_color = SELECT_COLOR
 
-		clicked := do_ui_element(state, pos, pm.name, bg_color, true)
+		clicked := do_ui_element(state, pos, pm.name, 32, bg_color, true)
 		if clicked {
 			if state.selected_power_meter_index == i32(i) {
 				state.selected_power_meter_index = -1
@@ -140,8 +223,7 @@ draw_pairing_mode_ui :: proc(state: ^State) {
 }
 
 
-do_ui_element :: proc(state: ^State, pos: [2]f32, text: cstring, bg_color: rl.Color = {0, 0, 0, 0}, animate_hover: bool = false) -> bool {
-	font_size : f32 = 32
+do_ui_element :: proc(state: ^State, pos: [2]f32, text: cstring, font_size: f32 = 32, bg_color: rl.Color = {0, 0, 0, 0}, animate_hover: bool = false) -> bool {
 	spacing : f32 = 1
 	padding : [4]f32 = {10, 10, 10, 10}
 	text_size := rl.MeasureTextEx(state.font, text, font_size, spacing)
@@ -157,8 +239,11 @@ do_ui_element :: proc(state: ^State, pos: [2]f32, text: cstring, bg_color: rl.Co
 	if mouse_in_rect && animate_hover {
 		rl.DrawRectangleRec(bounding_box, HOVER_COLOR)
 	}
-
-	rl.DrawTextEx(state.font, text, pos, font_size, spacing, rl.WHITE)
+	font := state.font
+	if font_size != 32 {
+		font = state.font_big
+	}
+	rl.DrawTextEx(font, text, pos, font_size, spacing, rl.WHITE)
 
 	if mouse_in_rect {
 		if state.mouse_pressed {
@@ -182,10 +267,14 @@ init :: proc() -> ^State {
 	global_allocator := mem.arena_allocator(&global_arena)
 	state := new(State, allocator = global_allocator)
 	state.selected_power_meter_index = -1
+	state.power_data.array = make([dynamic]RideDataPoint, 0, DATA_ARRAY_SIZE, allocator = global_allocator)
+	rl.SetConfigFlags({.WINDOW_RESIZABLE})
 	rl.InitWindow(800, 600, "window")
 	rl.SetTargetFPS(60)
 	font_path : cstring = "assets/verdana.ttf"
 	state.font = rl.LoadFontEx(font_path, 32, nil, 250);
+	state.font_big = rl.LoadFontEx(font_path, 64, nil, 250);
+	export_to_gpx(state, "testfile.gpx", "Afternoon Ride")
 	thread.create_and_start_with_poly_data(data = state, fn = scan_for_ble_devices)
 	return state
 }

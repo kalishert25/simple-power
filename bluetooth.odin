@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:sync"
 import "core:c"
 import "base:runtime"
+import "core:time"
 import ble "simpleble"
 
 
@@ -163,6 +164,10 @@ indoor_bike_data_callback :: proc "c" (
 	flags := u16(data[0]) | (u16(data[1]) << 8)
 	offset : c.size_t = 2
 
+	// get the time
+	current_time := time.now()
+	unix_seconds := cast(u32)time.to_unix_seconds(current_time)
+
 	if flags & (1 << 0) == 0 do offset += 2 // Instantaneous Speed
 	if flags & (1 << 1) != 0 do offset += 2 // Average Speed
 	if flags & (1 << 2) != 0 do offset += 2 // Instantaneous Cadence
@@ -174,10 +179,43 @@ indoor_bike_data_callback :: proc "c" (
 		if offset + 2 > data_length do return
 		power := i16(data[offset]) | (i16(data[offset+1]) << 8)
 
-		sync.lock(&state.data_stream_mu)
-		state.current_power = power
-		sync.unlock(&state.data_stream_mu)
+		data_point := RideDataPoint {
+			time = unix_seconds,
+			value = i32(power),
+		}
 
-		fmt.printfln("Instantaneous Power: %d W", power)
+		ride_data_array_append(&state.power_data, data_point)
+
 	}
+}
+
+ride_data_array_append :: proc(ride_data: ^RideDataArray, data_point: RideDataPoint) {
+	ensure(len(ride_data.array) < DATA_ARRAY_SIZE)
+
+	sync.lock(&ride_data.mutex)
+	defer sync.unlock(&ride_data.mutex)
+
+	if len(ride_data.array) == 0 {
+		append(&ride_data.array, data_point)
+		return
+	}
+
+	cursor := len(ride_data.array)
+	for ; cursor > 0; cursor -= 1 {
+		previous := ride_data.array[cursor - 1]
+		if previous.time <= data_point.time {
+			break
+		}
+	}
+	inject_at(&ride_data.array, cursor, data_point)
+}
+
+ride_data_get_current_value :: proc(ride_data: ^RideDataArray) -> i32 {
+	sync.lock(&ride_data.mutex)
+	defer sync.unlock(&ride_data.mutex)
+	count := len(ride_data.array)
+	if count == 0 {
+		return 0
+	}
+	return ride_data.array[count - 1].value
 }
