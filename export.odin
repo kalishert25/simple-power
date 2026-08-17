@@ -13,7 +13,9 @@ ride_data_array_sample_time_interval :: proc(ride_data_array: ^RideDataArray, st
 	data := ride_data_array.array
 	total := i64(0)
 	num_data_points : i32 = 0
-	for index := start_index; index < i32(len(data)); index += 1 {
+
+	index := start_index
+	for ; index < i32(len(data)); index += 1 {
 		before_start_of_interval := time.diff(data[index].time, start_time) > 0
 		if before_start_of_interval {
 			continue
@@ -30,12 +32,12 @@ ride_data_array_sample_time_interval :: proc(ride_data_array: ^RideDataArray, st
 	}
 
 	if num_data_points == 0 {
-		return 0, start_index
+		return 0, index
 	}
 
 	avg := f64(total) / f64(num_data_points)
 
-	return avg, start_index + num_data_points
+	return avg, index
 
 
 }
