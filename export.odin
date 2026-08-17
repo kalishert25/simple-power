@@ -6,7 +6,7 @@ import "core:fmt"
 import "core:sync"
 import "core:time"
 import "core:mem"
-import "core:slice"
+
 
 ride_data_array_sample_time_interval :: proc(ride_data_array: ^RideDataArray, start_time, end_time: time.Time, start_index: i32 = 0) -> (value: f64, end_index: i32) {
 	assert(time.diff(start_time, end_time) >= 0)
@@ -23,7 +23,7 @@ ride_data_array_sample_time_interval :: proc(ride_data_array: ^RideDataArray, st
 
 		after_end_of_interval := time.diff(end_time, data[index].time) >= 0
 		if after_end_of_interval {
-			break
+			breakiefef
 		}
 
 		num_data_points += 1
@@ -106,30 +106,56 @@ export_to_gpx :: proc(state: ^State, filename: string, ride_name: string) -> (su
 		)
 	}
 
-	first_trackpoint_time := state.location_data.array[0].time
-	start_time : time.Time
+	current_second : time.Time
 	{
+		first_trackpoint_time := state.location_data.array[0].time
 		epoch := time.unix(0, 0)
-		duration_since_epoch := time.diff(epoch, now)
-		rounded_duration := time.duration_round(dur_since_epoch, time.Second)
-		start_time := time.time_add(epoch, rounded_duration)
+		duration_since_epoch := time.diff(epoch, first_trackpoint_time)
+		rounded_duration := time.duration_round(duration_since_epoch, time.Second)
+		current_second = time.time_add(epoch, rounded_duration)
 	}
 
 
+	power_data_index := 0
+	location_data_index := 0
 
-	// track points
-	track_point_format_string := `<trkpt lat="%f" lon="%f">
+	for location_data_index < len(state.location_data) {
+		defer free_all(time_allocator)
+		start_time := time.add(current_second, -500 * time.Millisecond)
+		end_time := time.add(current_second, 500 * time.Millisecond)
+		location: [2]f64
+		location, location_data_index = ride_data_array_sample_time_interval(
+			&state.location_data, start_time, end_time, location_data_index
+		)
+		power: i64
+		power, power_data_index = ride_data_array_sample_time_interval(
+			&state.location_data, start_time, end_time, location_data_index
+		)
+
+		time_formatted := time.time_to_rfc3339(current_second, include_nanos=false, allocator=time_allocator)
+		track_point_format_string := `<trkpt lat="%f" lon="%f">
     <ele>0</ele>
     <time>%s</time>
     <extensions>
      <power>%v</power>
      <gpxtpx:TrackPointExtension>
       <gpxtpx:atemp>24</gpxtpx:atemp>
-      <gpxtpx:cad>%v</gpxtpx:cad>
+      <gpxtpx:cad>0</gpxtpx:cad>
      </gpxtpx:TrackPointExtension>
     </extensions>
   </trkpt>
   `
+  fmt.wprintln(
+			buffered_stream,
+			track_point_format_string,
+			location.x,
+			location.y,
+			time_formatted,
+			power,
+			flush=false
+		)
+	}
+
 	// footer
 	{
 

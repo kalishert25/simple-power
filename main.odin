@@ -14,6 +14,8 @@ import ble "simpleble"
 
 MAX_DEVICES :: 10
 DATA_ARRAY_SIZE :: 2 * mem.Megabyte
+LOCATION_SAMPLE_RATE :: 200 * time.Millisecond
+
 
 BG_COLOR 				:: rl.Color{20, 20, 50, 255}
 HOVER_COLOR 		:: rl.Color{60, 60, 100, 255}
@@ -76,7 +78,8 @@ State :: struct {
 	font: rl.Font,
 	font_big: rl.Font,
 	mode: Mode,
-	power_data: RideDataArray,
+	power_data: RideDataArray(i64),
+	location_data: RideDataArray([2]f64),
 	longitude_latitude_data: RideDataArray,
 	distance_traveled: f32,
 	velocity: f32,
@@ -103,12 +106,34 @@ RideDataArray :: struct {
 	graph_starting_index: i32,
 }
 
-RideDataPoint :: struct {
+
+RideDataPoint :: struct($T: typeid) {
 	time: time.Time,
-	value: i64,
+	value: T,
 }
 
 
+sample_current_location :: proc(state: ^State) {
+	for {
+		sync.lock(&state.location_data.mutex)
+		defer sync.unlock(&state.location_data.mutex)
+
+		now := time.now()
+		current_pos := sync.atomic_load(&state.current_pos)
+		location := earth_lat_lon_from_world_space(current_pos)
+
+		data_point := RideDataPoint{
+			time = now,
+			value = location,
+		}
+		append(&ride_data.array, data_point)
+
+		time.sleep(LOCATION_SAMPLE_RATE)
+	}
+}
+
+// Generates a path which includes the anchor points and the
+// control points that define a series of cubic bezier curves
 path_from_anchor_points :: proc(anchor_points: [][2]f32, allocator: mem.Allocator ) -> [][2]f32 {
 
 	total_point_count : int
@@ -284,6 +309,8 @@ enter_ride_mode_from_pairing_mode :: proc(state: ^State) {
 	// don't unlock the mutex while we remain in ride mode.
 	// this will block the background thread from listening for new devices
 	state.mode = .RIDING
+
+	thread.create_and_start_with_poly_data(data = state, fn = sample_current_location)
 }
 
 main :: proc() {
@@ -300,6 +327,13 @@ main :: proc() {
 		if rl.IsKeyPressed(.ENTER) {
 			if state.selected_power_meter_index >= 0 && state.mode == .PAIRING {
 				enter_ride_mode_from_pairing_mode(state)
+			}
+		}
+
+
+		if rl.IsKeyPressed(.G) {
+			if state.mode == .RIDING {
+				export_to_gpx(state, "testfile.gpx", "Afternoon Ride")
 			}
 		}
 
@@ -339,7 +373,11 @@ main :: proc() {
 
 		state.distance_traveled += state.velocity * delta_time
 
-		state.current_pos = pos_from_total_distance_traveled(state, state.distance_traveled)
+
+		sync.atomic_store(
+			&state.current_pos,
+			pos_from_total_distance_traveled(state, state.distance_traveled)
+		)
 
 
 		draw(state)
@@ -398,7 +436,9 @@ draw :: proc(state: ^State) {
 					prev_pos = pos
 				}
 			}
-			rl.DrawCircleV(100 + state.current_pos * 2, 10, rl.RED)
+
+			current_pos := sync.atomic_load(&state.current_pos)
+			rl.DrawCircleV(100 + current_pos * 2, 10, rl.RED)
 		}
 
 
@@ -552,7 +592,6 @@ init :: proc() -> ^State {
 	state.arc_length_lookup_table, state.path_total_distance = arc_length_lookup_table_from_path(state.path, 200, global_allocator)
 	pos_from_total_distance_traveled(state, 50)
 
-	export_to_gpx(state, "testfile.gpx", "Afternoon Ride")
 	thread.create_and_start_with_poly_data(data = state, fn = scan_for_ble_devices)
 	return state
 }
