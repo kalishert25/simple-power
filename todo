@@ -1,0 +1,5 @@
+sample current location at a fixed time interval (preferablly on a background thread so it's not framerate dependant)
+use location data to generate gpx file
+add cadence data
+support other protocols like power meters and heart rate straps
+make map look nicer

@@ -30,8 +30,6 @@ scan_for_ble_devices :: proc(state: ^State) {
 
 		ble.adapter_scan_for(adapter, 3000)
 
-		// check if we're done
-		//
 
 		device_count := ble.adapter_scan_get_results_count(adapter)
 		fmt.printf("Found %d devices.\n", device_count)
@@ -82,11 +80,6 @@ scan_for_ble_devices :: proc(state: ^State) {
 				append(&new_ble_devices, device)
 			}
 
-		}
-
-		if sync.atomic_load(&state.stop_scanning_for_ble_devices) {
-			fmt.println("Stopped scanning")
-			return
 		}
 
 		sync.lock(&state.ble_devices_mu)
@@ -166,7 +159,6 @@ indoor_bike_data_callback :: proc "c" (
 
 	// get the time
 	current_time := time.now()
-	unix_seconds := cast(u32)time.to_unix_seconds(current_time)
 
 	if flags & (1 << 0) == 0 do offset += 2 // Instantaneous Speed
 	if flags & (1 << 1) != 0 do offset += 2 // Average Speed
@@ -180,8 +172,8 @@ indoor_bike_data_callback :: proc "c" (
 		power := i16(data[offset]) | (i16(data[offset+1]) << 8)
 
 		data_point := RideDataPoint {
-			time = unix_seconds,
-			value = i32(power),
+			time = current_time,
+			value = i64(power),
 		}
 
 		ride_data_array_append(&state.power_data, data_point)
@@ -195,27 +187,5 @@ ride_data_array_append :: proc(ride_data: ^RideDataArray, data_point: RideDataPo
 	sync.lock(&ride_data.mutex)
 	defer sync.unlock(&ride_data.mutex)
 
-	if len(ride_data.array) == 0 {
-		append(&ride_data.array, data_point)
-		return
-	}
-
-	cursor := len(ride_data.array)
-	for ; cursor > 0; cursor -= 1 {
-		previous := ride_data.array[cursor - 1]
-		if previous.time <= data_point.time {
-			break
-		}
-	}
-	inject_at(&ride_data.array, cursor, data_point)
-}
-
-ride_data_get_current_value :: proc(ride_data: ^RideDataArray) -> i32 {
-	sync.lock(&ride_data.mutex)
-	defer sync.unlock(&ride_data.mutex)
-	count := len(ride_data.array)
-	if count == 0 {
-		return 0
-	}
-	return ride_data.array[count - 1].value
+	append(&ride_data.array, data_point)
 }

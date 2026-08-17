@@ -6,11 +6,56 @@ import "core:fmt"
 import "core:sync"
 import "core:time"
 import "core:mem"
+import "core:slice"
+
+ride_data_array_sample_time_interval :: proc(ride_data_array: ^RideDataArray, start_time, end_time: time.Time, start_index: i32 = 0) -> (value: f64, end_index: i32) {
+	assert(time.diff(start_time, end_time) >= 0)
+	data := ride_data_array.array
+	total := i64(0)
+	num_data_points : i32 = 0
+	for index := start_index; index < i32(len(data)); index += 1 {
+		before_start_of_interval := time.diff(data[index].time, start_time) > 0
+		if before_start_of_interval {
+			continue
+		}
+
+		after_end_of_interval := time.diff(end_time, data[index].time) >= 0
+		if after_end_of_interval {
+			break
+		}
+
+		num_data_points += 1
+		total += data[index].value
+
+	}
+
+	if num_data_points == 0 {
+		return 0, start_index
+	}
+
+	avg := f64(total) / f64(num_data_points)
+
+	return avg, start_index + num_data_points
+
+
+}
+
 
 export_to_gpx :: proc(state: ^State, filename: string, ride_name: string) -> (success: bool) {
 
-	success = false
 	defer free_all(context.temp_allocator)
+
+	sync.lock(&state.power_data.mutex)
+	defer sync.unlock(&state.power_data.mutex)
+
+	sync.lock(&state.location_data.mutex)
+	defer sync.unlock(&state.location_data.mutex)
+
+	if len(state.location_data.array) == 0 {
+		return false
+	}
+
+
 	export_path, err := os.join_path({"exports", filename}, context.temp_allocator)
 	if err != nil {
 		return false
@@ -28,10 +73,6 @@ export_to_gpx :: proc(state: ^State, filename: string, ride_name: string) -> (su
 	writer: bufio.Writer
 	bufio.writer_init(&writer, file_stream, allocator=context.temp_allocator)
 	buffered_stream := bufio.writer_to_stream(&writer)
-
-	sync.lock(&state.power_data.mutex)
-	defer sync.unlock(&state.power_data.mutex)
-
 
 	time_buffer: [35]u8
 	time_arena: mem.Arena
@@ -63,6 +104,17 @@ export_to_gpx :: proc(state: ^State, filename: string, ride_name: string) -> (su
 		)
 	}
 
+	first_trackpoint_time := state.location_data.array[0].time
+	start_time : time.Time
+	{
+		epoch := time.unix(0, 0)
+		duration_since_epoch := time.diff(epoch, now)
+		rounded_duration := time.duration_round(dur_since_epoch, time.Second)
+		start_time := time.time_add(epoch, rounded_duration)
+	}
+
+
+
 	// track points
 	track_point_format_string := `<trkpt lat="%f" lon="%f">
     <ele>0</ele>
@@ -75,16 +127,15 @@ export_to_gpx :: proc(state: ^State, filename: string, ride_name: string) -> (su
      </gpxtpx:TrackPointExtension>
     </extensions>
   </trkpt>
+  `
 	// footer
 	{
-		footer_format_string := `  </trkseg>
- </trk>
-</gpx>
-`
+
+		footer_string := "  </trkseg>\n </trk>\n</gpx>"
 
 		fmt.wprintln(
 			buffered_stream,
-			footer_format_string,
+			footer_string,
 			flush=false
 		)
 
