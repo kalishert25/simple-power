@@ -13,9 +13,6 @@ CYCLING_POWER_SERVICE :: ble.UUID{
 FTMS_SERVICE :: ble.UUID{
 	value = "00001826-0000-1000-8000-00805f9b34fb\x00"
 }
-INDOOR_BIKE_CHARACTERISTIC :: ble.UUID{
-	value="00002ad2-0000-1000-8000-00805f9b34fb\x00"
-}
 
 scan_for_ble_devices :: proc(state: ^State) {
 
