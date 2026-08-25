@@ -22,19 +22,22 @@ HOVER_COLOR 		:: rl.Color{60, 60, 100, 255}
 TEXT_COLOR 			:: rl.Color{190, 190, 230, 255}
 SELECT_COLOR    :: rl.Color{50, 120, 90, 255}
 
-LAT_LON_ORIGIN :: [2]f32{0, 0}
+LAT_LON_ORIGIN :: [2]f64{0, 0}
 
 EARTH_MEAN_RADIUS :: 6_371_000.0
 
-GRAPH_LOOKBACK_SECONDS :: 60 * 5
-PATH_ANCHOR_POINTS := [?][2]f32{
+GRAPH_LOOKBACK_SECONDS :: 30 * 1
+PATH_ANCHOR_POINTS := [?][2]f64{
 	{0, 0},
-	{0, 50},
-	{50, 50},
-	{25, 0},
+	{200, 0},
+	{200, 200},
+	{120, 200},
+	{120, 100},
+	{60, 100},
+	{0, 150},
 }
 
-earth_lat_lon_from_world_space :: proc(pos: [2]f32) -> [2]f32 {
+earth_lat_lon_from_world_space :: proc(pos: [2]f64) -> [2]f64 {
 
 	rho := linalg.vector_length(pos)
 
@@ -74,19 +77,21 @@ State :: struct {
 	mouse_pos: [2]f32,
 	screen_size: [2]f32,
 	mouse_pressed: bool,
-	selected_power_meter_index: i32,
+	selected_power_meter_index: int,
 	font: rl.Font,
 	font_big: rl.Font,
 	mode: Mode,
-	power_data: RideDataArray(i64),
-	location_data: RideDataArray([2]f64),
-	longitude_latitude_data: RideDataArray,
-	distance_traveled: f32,
-	velocity: f32,
-	path: [][2]f32,
-	path_total_distance: f32,
+	ride_data_array: [dynamic]RideDataPoint,
+	ride_data_mu: sync.Mutex,
+	distance_traveled: f64,
+	velocity: f64,
+	path: [][2]f64,
+	path_total_distance: f64,
 	arc_length_lookup_table: []ArcLengthLookupTableEntry,
-	current_pos: [2]f32,
+	current_pos: [2]f64,
+	current_pos_mu: sync.Mutex,
+	timer: time.Stopwatch,
+	path_bounding_box: rl.Rectangle,
 }
 
 DeviceView :: struct {
@@ -100,33 +105,44 @@ Mode :: enum {
 	RIDING,
 }
 
-RideDataArray :: struct {
-	mutex: sync.Mutex,
-	array: [dynamic]RideDataPoint,
-	graph_starting_index: i32,
+RideDataType :: enum {
+	LOCATION,
+	POWER,
+	CADENCE,
 }
 
+RideDataType_Set :: bit_set[RideDataType]
 
-RideDataPoint :: struct($T: typeid) {
+
+RideDataPoint :: struct {
 	time: time.Time,
-	value: T,
+	data_types: RideDataType_Set,
+	power: i32,
+	cadence: i32,
+	location: [2]f64,
 }
+
 
 
 sample_current_location :: proc(state: ^State) {
 	for {
-		sync.lock(&state.location_data.mutex)
-		defer sync.unlock(&state.location_data.mutex)
 
 		now := time.now()
-		current_pos := sync.atomic_load(&state.current_pos)
+		current_pos : [2]f64
+		{
+			sync.lock(&state.current_pos_mu)
+			defer sync.unlock(&state.current_pos_mu)
+			current_pos = state.current_pos
+		}
+
 		location := earth_lat_lon_from_world_space(current_pos)
 
 		data_point := RideDataPoint{
 			time = now,
-			value = location,
+			data_types = {.LOCATION},
+			location = location,
 		}
-		append(&ride_data.array, data_point)
+		ride_data_array_append(state, data_point)
 
 		time.sleep(LOCATION_SAMPLE_RATE)
 	}
@@ -134,7 +150,7 @@ sample_current_location :: proc(state: ^State) {
 
 // Generates a path which includes the anchor points and the
 // control points that define a series of cubic bezier curves
-path_from_anchor_points :: proc(anchor_points: [][2]f32, allocator: mem.Allocator ) -> [][2]f32 {
+path_from_anchor_points :: proc(anchor_points: [][2]f64, allocator: mem.Allocator ) -> [][2]f64 {
 
 	total_point_count : int
 	{
@@ -142,7 +158,7 @@ path_from_anchor_points :: proc(anchor_points: [][2]f32, allocator: mem.Allocato
 		total_point_count = control_point_count + len(anchor_points)
 	}
 
-	path := make([][2]f32, total_point_count, allocator)
+	path := make([][2]f64, total_point_count, allocator)
 
 	for index in 0..<len(anchor_points) {
 		current_anchor := anchor_points[index]
@@ -173,17 +189,17 @@ path_from_anchor_points :: proc(anchor_points: [][2]f32, allocator: mem.Allocato
 }
 
 ArcLengthLookupTableEntry :: struct {
-	arc_length: f32,
+	arc_length: f64,
 	offset: i32,
-	t: f32,
+	t: f64,
 }
 
-pos_from_total_distance_traveled :: proc(state: ^State, total_distance_traveled: f32) -> [2]f32 {
+pos_from_total_distance_traveled :: proc(state: ^State, total_distance_traveled: f64) -> [2]f64 {
 	assert(total_distance_traveled >= 0)
 
 	arc_length := math.mod(total_distance_traveled, state.path_total_distance)
 
-	compare :: proc(entry: ArcLengthLookupTableEntry, arc_length: f32) -> slice.Ordering {
+	compare :: proc(entry: ArcLengthLookupTableEntry, arc_length: f64) -> slice.Ordering {
 		compare_result := slice.cmp(entry.arc_length, arc_length)
 		if compare_result == .Equal {
 			return .Less
@@ -232,20 +248,20 @@ pos_from_total_distance_traveled :: proc(state: ^State, total_distance_traveled:
 }
 
 
-arc_length_lookup_table_from_path :: proc(path: [][2]f32, sample_point_count: int, allocator: mem.Allocator) -> ([]ArcLengthLookupTableEntry, f32) {
+arc_length_lookup_table_from_path :: proc(path: [][2]f64, sample_point_count: int, allocator: mem.Allocator) -> ([]ArcLengthLookupTableEntry, f64) {
 	arc_length_lookup_table := make([]ArcLengthLookupTableEntry, sample_point_count, allocator)
 	assert(len(path) % 3 == 0)
 	anchor_point_count := len(path) / 3
 
-	t_max := f32(anchor_point_count)
+	t_max := f64(anchor_point_count)
 
-	t_step_size := t_max / f32(sample_point_count)
+	t_step_size := t_max / f64(sample_point_count)
 
 	offset : i32 = 0
-	total_arc_length := f32(0)
+	total_arc_length := f64(0)
 	prev_pos := path[0]
 	index := 0
-	t : f32 = 0
+	t : f64 = 0
 
 	fmt.printfln("\n")
 	n := i32(len(path))
@@ -257,7 +273,6 @@ arc_length_lookup_table_from_path :: proc(path: [][2]f32, sample_point_count: in
 		pos := sample_path(path, offset, t)
 
 		distance := linalg.vector_length(prev_pos - pos)
-		fmt.printf("(%.3f, %.3f),", pos.x, pos.y)
 
 		total_arc_length += distance
 		prev_pos = pos
@@ -273,7 +288,7 @@ arc_length_lookup_table_from_path :: proc(path: [][2]f32, sample_point_count: in
 	return arc_length_lookup_table, total_arc_length
 }
 
-sample_path :: proc(path: [][2]f32, offset: i32, t: f32) -> [2]f32 {
+sample_path :: proc(path: [][2]f64, offset: i32, t: f64) -> [2]f64 {
 	assert(offset % 3 == 0)
 	assert(offset >= 0 && offset < i32(len(path)))
 	pos := evaluate_cubic_bezier(
@@ -285,6 +300,25 @@ sample_path :: proc(path: [][2]f32, offset: i32, t: f32) -> [2]f32 {
 	)
 
 	return pos
+}
+
+
+bounding_box_from_path :: proc(path: [][2]f64) -> rl.Rectangle {
+
+	min_x, min_y, max_x, max_y: f64
+
+	for offset := i32(0); offset < i32(len(path)); offset += 3 {
+		for t := f64(0); t < 1; t += 0.001 {
+			pos := sample_path(path, offset, t)
+			if pos.x > max_x do max_x = pos.x
+			if pos.x < min_x do min_x = pos.x
+			if pos.y > max_y do max_y = pos.y
+			if pos.y < min_y do min_y = pos.y
+		}
+	}
+	width := max_x - min_x
+	height := max_y - min_y
+	return rl.Rectangle{f32(min_x), f32(min_y), f32(width), f32(height)}
 }
 
 
@@ -311,6 +345,7 @@ enter_ride_mode_from_pairing_mode :: proc(state: ^State) {
 	state.mode = .RIDING
 
 	thread.create_and_start_with_poly_data(data = state, fn = sample_current_location)
+	time.stopwatch_start(&state.timer)
 }
 
 main :: proc() {
@@ -318,81 +353,96 @@ main :: proc() {
 	for !rl.WindowShouldClose() {
 		defer free_all(context.temp_allocator)
 
-
-		state.mouse_pos = rl.GetMousePosition();
-		state.mouse_pressed = rl.IsMouseButtonPressed(.LEFT)
-		state.screen_size.x = f32(rl.GetScreenWidth())
-		state.screen_size.y = f32(rl.GetScreenHeight())
-
-		if rl.IsKeyPressed(.ENTER) {
-			if state.selected_power_meter_index >= 0 && state.mode == .PAIRING {
-				enter_ride_mode_from_pairing_mode(state)
-			}
-		}
-
-
-		if rl.IsKeyPressed(.G) {
-			if state.mode == .RIDING {
-				export_to_gpx(state, "testfile.gpx", "Afternoon Ride")
-			}
-		}
-
-		delta_time := rl.GetFrameTime()
-
-		current_power := ride_data_get_current_value(&state.power_data)
-		drivetrain_efficiency : f32 = 0.98
-		rolling_resistance : f32 = 0.003
-		mass : f32 = 58 //kg
-		g : f32 = 9.8
-		cda : f32 = 0.32
-		air_density : f32 = 1.225
-		force_propulsion_max : f32 = 800
-		min_velocity : f32 = 1 // m/s
-
-		force_propulsion : f32 = 0
-
-		if current_power > 0 {
-			force_propulsion = f32(current_power) * drivetrain_efficiency / state.velocity
-
-			if force_propulsion > force_propulsion_max {
-				force_propulsion = force_propulsion_max
-			}
-		}
-
-		force_rolling_resistance := rolling_resistance * mass * g * -math.sign(state.velocity)
-		force_drag := 0.5 * cda * air_density * state.velocity * state.velocity * -math.sign(state.velocity)
-
-		force_net := force_propulsion + force_rolling_resistance + force_drag
-		acceleration := force_net / mass
-
-		state.velocity += acceleration * delta_time
-
-		if state.velocity < 0 || (current_power == 0 && state.velocity < min_velocity) {
-			state.velocity = 0
-		}
-
-		state.distance_traveled += state.velocity * delta_time
-
-
-		sync.atomic_store(
-			&state.current_pos,
-			pos_from_total_distance_traveled(state, state.distance_traveled)
-		)
-
-
+		update(state)
 		draw(state)
 	}
 }
 
+update ::proc(state: ^State) {
 
-ride_data_get_current_value :: proc(ride_data: ^RideDataArray) -> i64 {
-	sync.lock(&ride_data.mutex)
-	defer sync.unlock(&ride_data.mutex)
-	count := len(ride_data.array)
-	if count == 0 {
-		return 0
+	state.mouse_pos = rl.GetMousePosition();
+	state.mouse_pressed = rl.IsMouseButtonPressed(.LEFT)
+	state.screen_size.x = f32(rl.GetScreenWidth())
+	state.screen_size.y = f32(rl.GetScreenHeight())
+
+	if rl.IsKeyPressed(.ENTER) {
+		if state.selected_power_meter_index >= 0 && state.mode == .PAIRING {
+			enter_ride_mode_from_pairing_mode(state)
+		}
 	}
-	return ride_data.array[count - 1].value
+
+
+	if rl.IsKeyPressed(.G) {
+		if state.mode == .RIDING {
+			filename := fmt.tprintf("export-%d.gpx", time.now()._nsec)
+			export_to_gpx(state, filename, "Simple Power Ride")
+		}
+	}
+
+	delta_time := cast(f64)rl.GetFrameTime()
+
+	current_power := ride_data_get_current_value(state, .POWER).power
+	drivetrain_efficiency : f64 = 0.98
+	rolling_resistance : f64 = 0.003
+	mass : f64 = 58 //kg
+	g : f64 = 9.8
+	cda : f64 = 0.32
+	air_density : f64 = 1.225
+	force_propulsion_max : f64 = 800
+	min_velocity : f64 = 1 // m/s
+
+	force_propulsion : f64 = 0
+
+	if current_power > 0 {
+		force_propulsion = f64(current_power) * drivetrain_efficiency / state.velocity
+
+		if force_propulsion > force_propulsion_max {
+			force_propulsion = force_propulsion_max
+		}
+	}
+
+	force_rolling_resistance := rolling_resistance * mass * g * -math.sign(state.velocity)
+	force_drag := 0.5 * cda * air_density * state.velocity * state.velocity * -math.sign(state.velocity)
+
+	force_net := force_propulsion + force_rolling_resistance + force_drag
+	acceleration := force_net / mass
+
+	state.velocity += acceleration * delta_time
+
+	if state.velocity < 0 || (current_power == 0 && state.velocity < min_velocity) {
+		state.velocity = 0
+	}
+
+	state.distance_traveled += state.velocity * delta_time
+
+	{
+		sync.lock(&state.current_pos_mu)
+		defer sync.unlock(&state.current_pos_mu)
+		state.current_pos = pos_from_total_distance_traveled(state, state.distance_traveled)
+	}
+
+}
+
+ride_data_get_current_value :: proc(state: ^State, data_type: RideDataType) -> RideDataPoint {
+	sync.lock(&state.ride_data_mu)
+	defer sync.unlock(&state.ride_data_mu)
+
+	result := RideDataPoint{}
+	for i := len(state.ride_data_array) - 1; i >= 0; i -= 1 {
+		data_point := state.ride_data_array[i]
+
+		if data_type in data_point.data_types {
+			result = data_point
+			break
+		}
+	}
+
+	cutoff_time := 5 * time.Second
+	if time.diff(result.time, time.now()) > cutoff_time {
+		result.power = 0
+	}
+
+	return result
 }
 
 
@@ -408,171 +458,11 @@ draw :: proc(state: ^State) {
 		draw_pairing_mode_ui(state)
 
 	case .RIDING:
-
-		{
-			pos := [2]f32{40, 40}
-			current_power := ride_data_get_current_value(&state.power_data)
-			text := fmt.ctprintf("%d W", current_power)
-			font_size := f32(64)
-			do_ui_element(state, pos, text, font_size)
-		}
-
-		{
-			pos := [2]f32{200, 40}
-			text := fmt.ctprintf("%.2f m. v=%.2f", state.distance_traveled, state.velocity * 2.237)
-			font_size := f32(64)
-			do_ui_element(state, pos, text, font_size)
-		}
-
-		{ // draw map
-			prev_pos := state.path[0]
-			for offset := i32(0); offset < i32(len(state.path)); offset += 3 {
-				for t := f32(0); t < 1; t += 0.1 {
-
-					pos := sample_path(state.path, offset, t)
-					if offset > 0 || t > 0 {
-						rl.DrawLineEx(100 + prev_pos * 2, 100 + pos * 2, 10, HOVER_COLOR)
-					}
-					prev_pos = pos
-				}
-			}
-
-			current_pos := sync.atomic_load(&state.current_pos)
-			rl.DrawCircleV(100 + current_pos * 2, 10, rl.RED)
-		}
-
-
-
-		starting_y_axis_maximum := 100
-		max_value := i64(starting_y_axis_maximum)
-		for i := state.power_data.graph_starting_index;
-			i < i32(len(state.power_data.array)); i += 1 {
-			value := state.power_data.array[i].value
-			if value > max_value {
-				max_value = value
-			}
-		}
-
-
-		graph_top 		: f32	= state.screen_size.y - 400
-		graph_bottom 	: f32 = state.screen_size.y - 50
-		graph_right 	: f32 = state.screen_size.x - 50
-		graph_left 		: f32 = 50
-
-		graph_width  := graph_right - graph_left
-		graph_height := graph_bottom - graph_top
-
-		graph_rect := rl.Rectangle{graph_left, graph_top, graph_width, graph_height}
-
-
-		// draw graph
-		{
-
-			graph_pos_from_data_point := proc(state: ^State, data_point: RideDataPoint, graph_rect: rl.Rectangle, max_value: i64) -> [2]f32 {
-
-
-				graph_right := graph_rect.x + graph_rect.width
-				graph_bottom := graph_rect.y + graph_rect.height
-
-				graph_start_cuttoff_time := time.time_add(time.now(), -GRAPH_LOOKBACK_SECONDS * time.Second)
-				width_per_second := graph_rect.width/GRAPH_LOOKBACK_SECONDS
-
-				seconds_after_duration_start := cast(f32)time.duration_seconds(time.diff(graph_start_cuttoff_time, data_point.time))
-				xvalue := graph_rect.width * seconds_after_duration_start / f32(GRAPH_LOOKBACK_SECONDS)
-				height := graph_rect.height * f32(data_point.value) / f32(max_value)
-				pos := [2]f32{(graph_right - xvalue), (graph_bottom - height)}
-				return pos
-			}
-
-			for i := state.power_data.graph_starting_index;
-				i < i32(len(state.power_data.array)) - 1; i += 1 {
-				data_point0 := state.power_data.array[i]
-				data_point1 := state.power_data.array[i+1]
-
-				pos0 := graph_pos_from_data_point(state, data_point0, graph_rect, max_value)
-				pos1 := graph_pos_from_data_point(state, data_point1, graph_rect, max_value)
-			  rl.DrawLineEx(pos0, pos1, 2, rl.PURPLE)
-
-			}
-		}
+		draw_riding_mode_ui(state)
 	}
 }
 
 
-draw_pairing_mode_ui :: proc(state: ^State) {
-
-	sync.lock(&state.ble_devices_mu)
-	defer sync.unlock(&state.ble_devices_mu)
-
-
-	{ // title text
-		title : cstring
-		if len(state.ble_devices) == 0 {
-			title = "No devices found."
-		} else if state.selected_power_meter_index == -1 {
-			title = "Select a power meter."
-		} else {
-			title = "Press enter to continue."
-		}
-		pos := [2]f32{20, 20}
-		do_ui_element(state, pos, title)
-	}
-
-	for pm, i in state.ble_devices {
-		pos := [2]f32{50, 60 * (f32(i) + 1.5) }
-
-		bg_color : rl.Color  //HIGHLIGHT_COLOR
-		if state.selected_power_meter_index == i32(i) do bg_color = SELECT_COLOR
-
-		clicked := do_ui_element(state, pos, pm.name, 32, bg_color, true)
-		if clicked {
-			if state.selected_power_meter_index == i32(i) {
-				state.selected_power_meter_index = -1
-			} else {
-				state.selected_power_meter_index = i32(i)
-			}
-			fmt.printfln("clicked on index %d", i)
-		}
-	}
-}
-
-
-do_ui_element :: proc(state: ^State, pos: [2]f32, text: cstring, font_size: f32 = 32, bg_color: rl.Color = {0, 0, 0, 0}, animate_hover: bool = false) -> bool {
-	spacing : f32 = 1
-	padding : [4]f32 = {10, 10, 10, 10}
-	text_size := rl.MeasureTextEx(state.font, text, font_size, spacing)
-	bounding_box := rl.Rectangle{
-		pos.x - padding[0], pos.y - padding[1],
-		text_size.x + padding[0] + padding[2],
-		text_size.y + padding[1] + padding[3]}
-	mouse_in_rect := vec2_in_rect(state.mouse_pos, bounding_box)
-
-	if bg_color != (rl.Color{0, 0, 0, 0}) {
-		rl.DrawRectangleRec(bounding_box, bg_color)
-	}
-	if mouse_in_rect && animate_hover {
-		rl.DrawRectangleRec(bounding_box, HOVER_COLOR)
-	}
-	font := state.font
-	if font_size != 32 {
-		font = state.font_big
-	}
-	rl.DrawTextEx(font, text, pos, font_size, spacing, rl.WHITE)
-
-	if mouse_in_rect {
-		if state.mouse_pressed {
-			return true
-		}
-	}
-	return false
-}
-
-vec2_in_rect :: proc(vec2: [2]f32, rect: rl.Rectangle) -> bool {
-	return 	vec2.x > rect.x &&
-					vec2.y > rect.y &&
-				 	vec2.x < (rect.x + rect.width) &&
-					vec2.y < (rect.y + rect.height)
-}
 
 init :: proc() -> ^State {
 
@@ -581,23 +471,36 @@ init :: proc() -> ^State {
 	global_allocator := mem.arena_allocator(&global_arena)
 	state := new(State, allocator = global_allocator)
 	state.selected_power_meter_index = -1
-	state.power_data.array = make([dynamic]RideDataPoint, 0, DATA_ARRAY_SIZE, allocator = global_allocator)
-	rl.SetConfigFlags({.WINDOW_RESIZABLE})
+	state.ride_data_array = make([dynamic]RideDataPoint, 0, DATA_ARRAY_SIZE)
+	rl.SetConfigFlags({.WINDOW_RESIZABLE, .WINDOW_ALWAYS_RUN})
 	rl.InitWindow(800, 600, "window")
 	rl.SetTargetFPS(60)
 	font_path : cstring = "assets/verdana.ttf"
 	state.font = rl.LoadFontEx(font_path, 32, nil, 250);
 	state.font_big = rl.LoadFontEx(font_path, 64, nil, 250);
 	state.path = path_from_anchor_points(PATH_ANCHOR_POINTS[:], global_allocator)
-	state.arc_length_lookup_table, state.path_total_distance = arc_length_lookup_table_from_path(state.path, 200, global_allocator)
-	pos_from_total_distance_traveled(state, 50)
 
+	sample_point_count : int
+	{
+		total_anchor_point_distance := f64(0)
+		for index := 0; index < len(PATH_ANCHOR_POINTS); index += 1 {
+			next_index := (index + 1) % len(PATH_ANCHOR_POINTS)
+			p0 := PATH_ANCHOR_POINTS[index]
+			p1 := PATH_ANCHOR_POINTS[next_index]
+			distance := linalg.vector_length(p1 - p0)
+			total_anchor_point_distance += distance
+		}
+		sample_point_count = int(2 * total_anchor_point_distance)
+	}
+
+	state.arc_length_lookup_table, state.path_total_distance = arc_length_lookup_table_from_path(state.path, sample_point_count, global_allocator)
+	state.path_bounding_box = bounding_box_from_path(state.path)
 	thread.create_and_start_with_poly_data(data = state, fn = scan_for_ble_devices)
 	return state
 }
 
 
-evaluate_cubic_bezier :: proc(p0, p1, p2, p3: [2]f32, t: f32) -> [2]f32 {
+evaluate_cubic_bezier :: proc(p0, p1, p2, p3: [2]f64, t: f64) -> [2]f64 {
 	u := 1-t
 
 	a := u*u*u
@@ -614,4 +517,27 @@ desmos_print :: proc(data: [][2]f32) {
 		fmt.printf("(%v,%v),", v.x, v.y)
 	}
 	fmt.print("]")
+}
+
+
+ride_data_array_append :: proc(state: ^State, data_point: RideDataPoint) {
+	ensure(len(state.ride_data_array) < DATA_ARRAY_SIZE)
+	fmt.printfln("Appending datapoint: %v", data_point)
+	sync.lock(&state.ride_data_mu)
+	defer sync.unlock(&state.ride_data_mu)
+
+	if len(state.ride_data_array) == 0 {
+		append(&state.ride_data_array, data_point)
+		return
+	}
+
+	i := len(state.ride_data_array)
+	for ; i >= 0; i -= 1 {
+		previous := state.ride_data_array[i - 1]
+		if time.diff(previous.time, data_point.time) >= 0 {
+			break
+		}
+	}
+
+	inject_at(&state.ride_data_array, i, data_point)
 }

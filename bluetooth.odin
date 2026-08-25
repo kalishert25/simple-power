@@ -7,9 +7,15 @@ import "base:runtime"
 import "core:time"
 import ble "simpleble"
 
-
-FTMS_SERVICE :: ble.UUID{value = "00001826-0000-1000-8000-00805f9b34fb\x00" }
-INDOOR_BIKE_CHARACTERISTIC :: ble.UUID{value="00002ad2-0000-1000-8000-00805f9b34fb\x00"}
+CYCLING_POWER_SERVICE :: ble.UUID{
+	value = "00001818-0000-1000-8000-00805f9b34fb\x00"
+}
+FTMS_SERVICE :: ble.UUID{
+	value = "00001826-0000-1000-8000-00805f9b34fb\x00"
+}
+INDOOR_BIKE_CHARACTERISTIC :: ble.UUID{
+	value="00002ad2-0000-1000-8000-00805f9b34fb\x00"
+}
 
 scan_for_ble_devices :: proc(state: ^State) {
 
@@ -159,10 +165,23 @@ indoor_bike_data_callback :: proc "c" (
 
 	// get the time
 	current_time := time.now()
+	data_point := RideDataPoint{
+		time = current_time,
+	}
+
 
 	if flags & (1 << 0) == 0 do offset += 2 // Instantaneous Speed
 	if flags & (1 << 1) != 0 do offset += 2 // Average Speed
-	if flags & (1 << 2) != 0 do offset += 2 // Instantaneous Cadence
+	if flags & (1 << 2) != 0 { // Instantaneous Cadence
+		double_cadence := i16(data[offset]) | (i16(data[offset+1]) << 8)
+		data_point.data_types |= {.CADENCE}
+		data_point.cadence = i32(double_cadence) / 2
+		offset += 2
+	}
+
+
+
+
 	if flags & (1 << 3) != 0 do offset += 2 // Average Cadence
 	if flags & (1 << 4) != 0 do offset += 3 // Total Distance
 	if flags & (1 << 5) != 0 do offset += 2 // Resistance Level
@@ -171,21 +190,12 @@ indoor_bike_data_callback :: proc "c" (
 		if offset + 2 > data_length do return
 		power := i16(data[offset]) | (i16(data[offset+1]) << 8)
 
-		data_point := RideDataPoint {
-			time = current_time,
-			value = i64(power),
-		}
-
-		ride_data_array_append(&state.power_data, data_point)
+		data_point.data_types |= {.POWER}
+		data_point.power = i32(power)
 
 	}
-}
 
-ride_data_array_append :: proc(ride_data: ^RideDataArray, data_point: RideDataPoint) {
-	ensure(len(ride_data.array) < DATA_ARRAY_SIZE)
-
-	sync.lock(&ride_data.mutex)
-	defer sync.unlock(&ride_data.mutex)
-
-	append(&ride_data.array, data_point)
+	if data_point.data_types != {} {
+		ride_data_array_append(state, data_point)
+	}
 }

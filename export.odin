@@ -6,13 +6,15 @@ import "core:fmt"
 import "core:sync"
 import "core:time"
 import "core:mem"
+import "core:math"
 
-
-ride_data_array_sample_time_interval :: proc(ride_data_array: ^RideDataArray, start_time, end_time: time.Time, start_index: i32 = 0) -> (value: f64, end_index: i32) {
+ride_data_array_sample_time_interval :: proc(state: ^State, start_time, end_time: time.Time, start_index: i32 = 0) -> (avg: RideDataPoint, end_index: i32) {
 	assert(time.diff(start_time, end_time) >= 0)
-	data := ride_data_array.array
-	total := i64(0)
-	num_data_points : i32 = 0
+	data := state.ride_data_array
+	total := RideDataPoint{}
+	num_data_points_with_power : i32 = 0
+	num_data_points_with_cadence : i32 = 0
+	num_data_points_with_location: i32 = 0
 
 	index := start_index
 	for ; index < i32(len(data)); index += 1 {
@@ -23,23 +25,46 @@ ride_data_array_sample_time_interval :: proc(ride_data_array: ^RideDataArray, st
 
 		after_end_of_interval := time.diff(end_time, data[index].time) >= 0
 		if after_end_of_interval {
-			breakiefef
+			break
 		}
 
-		num_data_points += 1
-		total += data[index].value
+		total.data_types |= data[index].data_types
+
+		if .POWER in data[index].data_types {
+			num_data_points_with_power += 1
+			total.power += data[index].power
+		}
+
+		if .CADENCE in data[index].data_types {
+			num_data_points_with_cadence += 1
+			total.cadence += data[index].cadence
+		}
+
+		if .LOCATION in data[index].data_types {
+			num_data_points_with_location += 1
+			total.location += data[index].location
+		}
 
 	}
 
-	if num_data_points == 0 {
-		return 0, index
+	avg = RideDataPoint{data_types=total.data_types}
+
+	if .POWER in total.data_types {
+		assert(num_data_points_with_power > 0)
+		avg.power = i32(math.round_f64(f64(total.power) / f64(num_data_points_with_power)))
 	}
 
-	avg := f64(total) / f64(num_data_points)
+	if .CADENCE in total.data_types {
+		assert(num_data_points_with_cadence > 0)
+		avg.cadence = i32(math.round_f64(f64(total.cadence) / f64(num_data_points_with_cadence)))
+	}
+
+	if .LOCATION in total.data_types {
+		assert(num_data_points_with_location > 0)
+		avg.location = total.location / f64(num_data_points_with_location)
+	}
 
 	return avg, index
-
-
 }
 
 
@@ -47,16 +72,13 @@ export_to_gpx :: proc(state: ^State, filename: string, ride_name: string) -> (su
 
 	defer free_all(context.temp_allocator)
 
-	sync.lock(&state.power_data.mutex)
-	defer sync.unlock(&state.power_data.mutex)
+	sync.lock(&state.ride_data_mu)
+	defer sync.unlock(&state.ride_data_mu)
 
-	sync.lock(&state.location_data.mutex)
-	defer sync.unlock(&state.location_data.mutex)
 
-	if len(state.location_data.array) == 0 {
+	if len(state.ride_data_array) == 0 {
 		return false
 	}
-
 
 	export_path, err := os.join_path({"exports", filename}, context.temp_allocator)
 	if err != nil {
@@ -108,7 +130,7 @@ export_to_gpx :: proc(state: ^State, filename: string, ride_name: string) -> (su
 
 	current_second : time.Time
 	{
-		first_trackpoint_time := state.location_data.array[0].time
+		first_trackpoint_time := state.ride_data_array[0].time
 		epoch := time.unix(0, 0)
 		duration_since_epoch := time.diff(epoch, first_trackpoint_time)
 		rounded_duration := time.duration_round(duration_since_epoch, time.Second)
@@ -116,42 +138,41 @@ export_to_gpx :: proc(state: ^State, filename: string, ride_name: string) -> (su
 	}
 
 
-	power_data_index := 0
-	location_data_index := 0
+	index := i32(0)
+	for ; index < i32(len(state.ride_data_array));
+	current_second = time.time_add(current_second, time.Second) {
 
-	for location_data_index < len(state.location_data) {
 		defer free_all(time_allocator)
-		start_time := time.add(current_second, -500 * time.Millisecond)
-		end_time := time.add(current_second, 500 * time.Millisecond)
-		location: [2]f64
-		location, location_data_index = ride_data_array_sample_time_interval(
-			&state.location_data, start_time, end_time, location_data_index
-		)
-		power: i64
-		power, power_data_index = ride_data_array_sample_time_interval(
-			&state.location_data, start_time, end_time, location_data_index
+
+		start_time := time.time_add(current_second, -500 * time.Millisecond)
+		end_time := time.time_add(current_second, 500 * time.Millisecond)
+		average_data_point: RideDataPoint
+		average_data_point, index = ride_data_array_sample_time_interval(
+			state, start_time, end_time, index
 		)
 
-		time_formatted := time.time_to_rfc3339(current_second, include_nanos=false, allocator=time_allocator)
-		track_point_format_string := `<trkpt lat="%f" lon="%f">
+		time_formatted, ok := time.time_to_rfc3339(current_second, include_nanos=false, allocator=time_allocator)
+		assert(ok)
+
+		track_point_format_string := `<trkpt lat="%.7f" lon="%.7f">
     <ele>0</ele>
     <time>%s</time>
     <extensions>
      <power>%v</power>
      <gpxtpx:TrackPointExtension>
-      <gpxtpx:atemp>24</gpxtpx:atemp>
-      <gpxtpx:cad>0</gpxtpx:cad>
+      <gpxtpx:cad>%v</gpxtpx:cad>
      </gpxtpx:TrackPointExtension>
     </extensions>
   </trkpt>
   `
-  fmt.wprintln(
+	  fmt.wprintfln(
 			buffered_stream,
 			track_point_format_string,
-			location.x,
-			location.y,
+			average_data_point.location.x,
+			average_data_point.location.y,
 			time_formatted,
-			power,
+			average_data_point.power,
+			average_data_point.cadence,
 			flush=false
 		)
 	}
@@ -170,5 +191,6 @@ export_to_gpx :: proc(state: ^State, filename: string, ride_name: string) -> (su
 	}
 
 	bufio.writer_flush(&writer)
+	fmt.printfln("Finished exporting file: %s", filename)
 	return true
 }
